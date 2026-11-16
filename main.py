@@ -1,399 +1,399 @@
 #!/usr/bin/env python3
-"""Skywhale — a whale swims UP through a sunset sky to touch the sun.
+"""Skywhale — a colossal whale swims up through a sunset sky to touch the sun.
 
-One image, drawn entirely by this program (Python 3.13 standard library
-only, no network, no randomness, no copied assets). The program rasterises
-a flat poster-style scene into a 1024x1024 RGB buffer and encodes it as a
-PNG with zlib+struct.
-
-The scene: a colossal whale rises diagonally through a deep sunset sky,
-its head aimed at a blazing sun. A tiny hot-air balloon drifts nearby for
-scale. The twist is the inversion — a whale does not fly, and it does not
-swim upward into the sky — yet here it does, mid-stroke, about to touch
-the light. One diagonal line of motion, one giant shape, one focal sun:
-the image still reads at 300 pixels wide.
+Procedural, deterministic, Python 3.13 standard library only (no network).
+Writes one 1024x1024 PNG to /output/entry.png (or $MAKEFUN_OUTPUT_DIR).
 """
 
 import math
 import os
+import random
 import struct
 import zlib
 
-W = H = 1024
+W = 1024
+H = 1024
 
-# ---------------------------------------------------------------- palette
-
-SKY_STOPS = [  # (fraction down the frame, (r, g, b))
-    (0.00, (10, 14, 46)),
-    (0.30, (24, 34, 84)),
-    (0.50, (62, 52, 110)),
-    (0.65, (146, 64, 110)),
-    (0.78, (214, 96, 74)),
-    (0.88, (247, 150, 66)),
-    (1.00, (252, 196, 104)),
-]
-
-SUN = (712, 318)          # sun centre
-SUN_R = 88                # sun disc radius
-SUN_CORE = (255, 232, 165)
-SUN_MID = (255, 190, 90)
-GLOW_COLOUR = (255, 176, 92)
-HALO_COLOUR = (255, 210, 130)
-
-WHALE_CENTRE = (520, 620)
-WHALE_RX = 300
-WHALE_RY = 135
-WHALE_ANGLE = math.radians(-24)   # head rises to the upper right
-WHALE_BODY = (46, 58, 103)
-WHALE_BELLY = (124, 140, 196)
-WHALE_RIM = (255, 196, 107)
-WHALE_DARK = (10, 12, 30)
-
-BALLOON = (845, 590)
-
-# ---------------------------------------------------------------- canvas
+# ---------------------------------------------------------------- pixel buffer
+buf = bytearray(W * H * 3)
 
 
-def _clamp(v, lo, hi):
-    return lo if v < lo else hi if v > hi else v
+def _idx(x, y):
+    return (y * W + x) * 3
 
 
-def _lerp(a, b, t):
+def set_px(x, y, r, g, b):
+    if 0 <= x < W and 0 <= y < H:
+        i = _idx(x, y)
+        buf[i] = r
+        buf[i + 1] = g
+        buf[i + 2] = b
+
+
+def fill_span(y, x0, x1, r, g, b):
+    if y < 0 or y >= H:
+        return
+    x0 = max(0, int(x0))
+    x1 = min(W - 1, int(x1))
+    if x1 < x0:
+        return
+    i = _idx(x0, y)
+    n = x1 - x0 + 1
+    buf[i:i + n * 3] = bytes((r, g, b)) * n
+
+
+def blend_span(y, x0, x1, r, g, b, a):
+    if y < 0 or y >= H:
+        return
+    x0 = max(0, int(x0))
+    x1 = min(W - 1, int(x1))
+    if x1 < x0:
+        return
+    inv = 1.0 - a
+    for x in range(x0, x1 + 1):
+        i = _idx(x, y)
+        buf[i] = int(buf[i] * inv + r * a)
+        buf[i + 1] = int(buf[i + 1] * inv + g * a)
+        buf[i + 2] = int(buf[i + 2] * inv + b * a)
+
+
+def lerp(a, b, t):
     return a + (b - a) * t
 
 
-class Canvas:
-    def __init__(self, w, h):
-        self.w = w
-        self.h = h
-        self.buf = bytearray(w * h * 3)
+def lerp_color(c1, c2, t):
+    return (int(lerp(c1[0], c2[0], t)),
+            int(lerp(c1[1], c2[1], t)),
+            int(lerp(c1[2], c2[2], t)))
 
-    # -- low level ------------------------------------------------------
 
-    def _blend_px(self, x, y, r, g, b, a):
-        """Blend one pixel, src-over, a in 0..1."""
-        if 0 <= x < self.w and 0 <= y < self.h:
-            i = (y * self.w + x) * 3
-            buf = self.buf
-            buf[i] = int(r * a + buf[i] * (1.0 - a) + 0.5)
-            buf[i + 1] = int(g * a + buf[i + 1] * (1.0 - a) + 0.5)
-            buf[i + 2] = int(b * a + buf[i + 2] * (1.0 - a) + 0.5)
-
-    def _span(self, y, x0, x1, colour):
-        """Fill a horizontal run on row y with a flat colour (fast)."""
-        if y < 0 or y >= self.h:
-            return
-        x0 = max(0, int(math.ceil(x0)))
-        x1 = min(self.w - 1, int(math.floor(x1)))
-        if x1 < x0:
-            return
-        r, g, b = colour
-        i = (y * self.w + x0) * 3
-        n = x1 - x0 + 1
-        self.buf[i:i + n * 3] = bytes((r, g, b)) * n
-
-    def _span_alpha(self, y, x0, x1, colour, a):
-        """Fill a horizontal run with a translucent colour."""
-        if y < 0 or y >= self.h or a <= 0.0:
-            return
-        x0 = max(0, int(math.ceil(x0)))
-        x1 = min(self.w - 1, int(math.floor(x1)))
-        if x1 < x0:
-            return
-        r, g, b = colour
-        buf = self.buf
-        ia = 1.0 - a
-        for x in range(x0, x1 + 1):
-            i = (y * self.w + x) * 3
-            buf[i] = int(r * a + buf[i] * ia + 0.5)
-            buf[i + 1] = int(g * a + buf[i + 1] * ia + 0.5)
-            buf[i + 2] = int(b * a + buf[i + 2] * ia + 0.5)
-
-    # -- fills ----------------------------------------------------------
-
-    def vgrad(self, stops):
-        """Vertical gradient; stops are (fraction, colour), sorted."""
-        for y in range(self.h):
-            t = y / (self.h - 1)
-            for k in range(len(stops) - 1):
-                f0, c0 = stops[k]
-                f1, c1 = stops[k + 1]
-                if f0 <= t <= f1:
-                    u = 0.0 if f1 == f0 else (t - f0) / (f1 - f0)
-                    r = int(_lerp(c0[0], c1[0], u) + 0.5)
-                    g = int(_lerp(c0[1], c1[1], u) + 0.5)
-                    b = int(_lerp(c0[2], c1[2], u) + 0.5)
-                    break
+# ------------------------------------------------------------------- primitives
+def fill_polygon(points, color, alpha=None):
+    if len(points) < 3:
+        return
+    ys = [p[1] for p in points]
+    y0 = max(0, int(math.ceil(min(ys))))
+    y1 = min(H - 1, int(math.floor(max(ys))))
+    n = len(points)
+    for y in range(y0, y1 + 1):
+        xs = []
+        for i in range(n):
+            x1, y1p = points[i]
+            x2, y2p = points[(i + 1) % n]
+            if (y1p <= y < y2p) or (y2p <= y < y1p):
+                t = (y - y1p) / (y2p - y1p)
+                xs.append(x1 + t * (x2 - x1))
+        xs.sort()
+        for k in range(0, len(xs) - 1, 2):
+            if alpha is None:
+                fill_span(y, xs[k], xs[k + 1], *color)
             else:
-                r, g, b = stops[-1][1]
-            i = y * self.w * 3
-            self.buf[i:i + self.w * 3] = bytes((r, g, b)) * self.w
+                blend_span(y, xs[k], xs[k + 1], *color, alpha)
 
-    def glow(self, cx, cy, radius, colour, strength):
-        """Soft radial glow; squared-distance falloff, no sqrt."""
-        r2 = radius * radius
-        x0 = max(0, cx - radius)
-        x1 = min(self.w - 1, cx + radius)
-        y0 = max(0, cy - radius)
-        y1 = min(self.h - 1, cy + radius)
-        cr, cg, cb = colour
-        buf = self.buf
-        w = self.w
-        for y in range(y0, y1 + 1):
-            dy = y - cy
-            dy2 = dy * dy
-            base = y * w * 3
-            for x in range(x0, x1 + 1):
-                dx = x - cx
-                q = 1.0 - (dx * dx + dy2) / r2
-                if q <= 0.0:
-                    continue
-                a = strength * q * q
-                i = base + x * 3
-                buf[i] = int(cr * a + buf[i] * (1.0 - a) + 0.5)
-                buf[i + 1] = int(cg * a + buf[i + 1] * (1.0 - a) + 0.5)
-                buf[i + 2] = int(cb * a + buf[i + 2] * (1.0 - a) + 0.5)
 
-    def ellipse(self, cx, cy, rx, ry, colour, angle=0.0, alpha=1.0,
-                edge_blend=False):
-        """Scanline-filled ellipse, optionally rotated (radians).
-
-        With edge_blend the two boundary pixels of each row are blended at
-        50%, which softens the silhouette by one pixel.
-        """
-        c = math.cos(angle)
-        s = math.sin(angle)
-        inv_rx2 = 1.0 / (rx * rx)
-        inv_ry2 = 1.0 / (ry * ry)
-        a_coef = c * c * inv_rx2 + s * s * inv_ry2
-        y0 = max(0, int(math.floor(cy - max(rx, ry))))
-        y1 = min(self.h - 1, int(math.ceil(cy + max(rx, ry))))
-        for y in range(y0, y1 + 1):
-            dy = y - cy
-            b_coef = 2.0 * c * s * dy * (inv_rx2 - inv_ry2)
-            c_coef = dy * dy * (s * s * inv_rx2 + c * c * inv_ry2) - 1.0
-            disc = b_coef * b_coef - 4.0 * a_coef * c_coef
-            if disc < 0.0:
-                continue
-            root = math.sqrt(disc) / (2.0 * a_coef)
-            mid = -b_coef / (2.0 * a_coef)
-            xa, xb = cx + mid - root, cx + mid + root
-            if alpha >= 1.0:
-                self._span(y, xa, xb, colour)
-                if edge_blend:
-                    self._blend_px(int(math.floor(xa)) - 1, y,
-                                   colour[0], colour[1], colour[2], 0.5)
-                    self._blend_px(int(math.ceil(xb)) + 1, y,
-                                   colour[0], colour[1], colour[2], 0.5)
-            else:
-                self._span_alpha(y, xa, xb, colour, alpha)
-
-    def circle(self, cx, cy, r, colour, alpha=1.0):
-        self.ellipse(cx, cy, r, r, colour, 0.0, alpha)
-
-    def polygon(self, points, colour, alpha=1.0):
-        """Even-odd scanline fill for a simple polygon."""
-        ys = [p[1] for p in points]
-        y0 = max(0, int(math.floor(min(ys))))
-        y1 = min(self.h - 1, int(math.ceil(max(ys))))
-        n = len(points)
-        for y in range(y0, y1 + 1):
-            xs = []
-            for k in range(n):
-                x1, y1p = points[k]
-                x2, y2p = points[(k + 1) % n]
-                if (y1p <= y < y2p) or (y2p <= y < y1p):
-                    t = (y - y1p) / (y2p - y1p)
-                    xs.append(x1 + t * (x2 - x1))
-            xs.sort()
-            for k in range(0, len(xs) - 1, 2):
-                if alpha >= 1.0:
-                    self._span(y, xs[k], xs[k + 1], colour)
-                else:
-                    self._span_alpha(y, xs[k], xs[k + 1], colour, alpha)
-
-    def disc_row(self, cx, cy, r, y, colour):
-        """One row of a small filled circle (helper for dots/lines)."""
+def fill_circle(cx, cy, rad, color, alpha=None):
+    r = int(rad)
+    for y in range(max(0, cy - r), min(H, cy + r + 1)):
         dy = y - cy
-        if abs(dy) > r:
-            return
-        half = math.sqrt(r * r - dy * dy)
-        self._span(y, cx - half, cx + half, colour)
+        dx = int(math.sqrt(max(0, rad * rad - dy * dy)))
+        if alpha is None:
+            fill_span(y, cx - dx, cx + dx, *color)
+        else:
+            blend_span(y, cx - dx, cx + dx, *color, alpha)
 
 
-# ---------------------------------------------------------------- whale
-
-def _local_to_global(cx, cy, angle, lx, ly):
-    """Whale-local coords -> frame coords. +x toward the head, +y belly."""
-    c = math.cos(angle)
-    s = math.sin(angle)
-    return (cx + c * lx - s * ly, cy + s * lx + c * ly)
-
-
-def draw_whale(cv):
-    cx, cy = WHALE_CENTRE
-    ang = WHALE_ANGLE
-    u = (math.cos(ang), math.sin(ang))       # toward head
-    v = (-math.sin(ang), math.cos(ang))      # toward belly
-    pt = lambda lx, ly: _local_to_global(cx, cy, ang, lx, ly)
-
-    # tail stock + flukes (drawn first so the body covers the joint)
-    stock = [pt(-290, -30), pt(-290, 30), pt(-425, 20),
-             pt(-452, 0), pt(-425, -20)]
-    cv.polygon(stock, WHALE_BODY)
-    fluke_up = [pt(-438, -10), pt(-475, -62), pt(-505, 4)]
-    fluke_dn = [pt(-438, 10), pt(-470, 66), pt(-498, 2)]
-    cv.polygon(fluke_up, WHALE_BODY)
-    cv.polygon(fluke_dn, WHALE_BODY)
-
-    # rim light: a gold ellipse peeking out above the body's top edge
-    rim_c = (cx - v[0] * 5, cy - v[1] * 5)
-    cv.ellipse(rim_c[0], rim_c[1], WHALE_RX, WHALE_RY, WHALE_RIM, ang)
-    # belly: a pale ellipse peeking out below the body's bottom edge
-    belly_c = (cx + v[0] * 26, cy + v[1] * 26)
-    cv.ellipse(belly_c[0], belly_c[1], WHALE_RX - 10, WHALE_RY - 8,
-               WHALE_BELLY, ang)
-    # body
-    cv.ellipse(cx, cy, WHALE_RX, WHALE_RY, WHALE_BODY, ang,
-               edge_blend=True)
-
-    # pectoral fin, tucked under the body, pointing back-down
-    fin = [pt(70, 55), pt(130, 120), pt(165, 95), pt(110, 48)]
-    cv.polygon(fin, (38, 48, 88))
-
-    # eye — one dark dot, high on the head
-    ex, ey = pt(252, -38)
-    cv.circle(int(ex), int(ey), 7, WHALE_DARK)
+def fill_ellipse(cx, cy, rx, ry, color, alpha=None):
+    for y in range(max(0, int(cy - ry)), min(H, int(cy + ry) + 1)):
+        t = (y - cy) / ry
+        dx = int(rx * math.sqrt(max(0.0, 1.0 - t * t)))
+        if alpha is None:
+            fill_span(y, cx - dx, cx + dx, *color)
+        else:
+            blend_span(y, cx - dx, cx + dx, *color, alpha)
 
 
-# ---------------------------------------------------------------- scene
+def thick_line(x0, y0, x1, y1, width, color, alpha=None):
+    dx = x1 - x0
+    dy = y1 - y0
+    length = math.hypot(dx, dy)
+    steps = max(1, int(length))
+    rad = width / 2.0
+    for s in range(steps + 1):
+        t = s / steps
+        fill_circle(int(x0 + dx * t), int(y0 + dy * t), rad, color, alpha)
 
 
-def _lcg(seed):
-    """Tiny deterministic generator (no random module, no time)."""
-    state = seed
-    while True:
-        state = (1103515245 * state + 12345) % 2147483648
-        yield state / 2147483648
+def polyline(points, width, color, alpha=None):
+    for i in range(len(points) - 1):
+        thick_line(points[i][0], points[i][1],
+                   points[i + 1][0], points[i + 1][1], width, color, alpha)
 
 
-def draw_scene(cv):
-    cv.vgrad(SKY_STOPS)
+# ------------------------------------------------------------------------- sky
+SKY_STOPS = [
+    (0, (24, 14, 48)),      # deep indigo
+    (330, (92, 36, 90)),    # violet
+    (600, (198, 72, 94)),   # rose
+    (800, (255, 122, 47)),  # burning orange horizon
+    (930, (120, 44, 62)),   # dusk band above the city
+    (1024, (40, 20, 44)),
+]
 
-    # stars, denser and brighter near the top
-    rng = _lcg(20261116)
+
+def sky_color(y):
+    for i in range(len(SKY_STOPS) - 1):
+        y0, c0 = SKY_STOPS[i]
+        y1, c1 = SKY_STOPS[i + 1]
+        if y0 <= y <= y1:
+            t = (y - y0) / max(1, y1 - y0)
+            return lerp_color(c0, c1, t)
+    return SKY_STOPS[-1][1]
+
+
+def draw_sky():
+    for y in range(H):
+        r, g, b = sky_color(y)
+        i = y * W * 3
+        buf[i:i + W * 3] = bytes((r, g, b)) * W
+
+
+SUN_X, SUN_Y = 700, 250
+
+
+def draw_stars():
+    rng = random.Random(11)
     for _ in range(150):
-        x = int(next(rng) * W)
-        y = int(next(rng) * next(rng) * 560)
-        bright = 140 + int(next(rng) * 115)
-        r = 1 if next(rng) < 0.75 else 2
-        col = (bright, bright, min(255, bright + 15))
-        cv.circle(x, y, r, col)
+        x = rng.randint(0, W - 1)
+        y = rng.randint(0, 430)
+        if math.hypot(x - SUN_X, y - SUN_Y) < 130:
+            continue
+        br = rng.randint(150, 255)
+        s = rng.random()
+        set_px(x, y, br, br, min(255, br + 10))
+        if s > 0.7:
+            set_px(x + 1, y, br // 2, br // 2, br // 2)
 
-    # sun glow, then the disc
-    cv.glow(SUN[0], SUN[1], 340, GLOW_COLOUR, 0.50)
-    cv.glow(SUN[0], SUN[1], 150, HALO_COLOUR, 0.35)
-    cv.circle(SUN[0], SUN[1], SUN_R, SUN_MID)
-    cv.circle(SUN[0], SUN[1], 62, SUN_CORE)
 
-    # soft clouds behind the whale — small clustered puffs, never flat discs
-    for (x, y, rx, ry, col, a) in (
-            (150, 300, 90, 26, (232, 160, 180), 0.18),
-            (230, 285, 110, 30, (232, 160, 180), 0.18),
-            (300, 305, 80, 24, (232, 160, 180), 0.16),
-            (780, 175, 90, 24, (200, 170, 220), 0.16),
-            (860, 165, 100, 26, (200, 170, 220), 0.16),
-            (920, 180, 70, 20, (200, 170, 220), 0.14),
-            (640, 120, 110, 22, (205, 175, 225), 0.14)):
-        cv.ellipse(x, y, rx, ry, col, 0.0, a)
+def draw_sun():
+    # wide soft glow, then the disc
+    for rad, a in ((300, 0.05), (260, 0.07), (220, 0.09), (180, 0.12),
+                   (150, 0.16), (120, 0.22), (100, 0.30)):
+        fill_circle(SUN_X, SUN_Y, rad, (255, 170, 90), alpha=a)
+    # faint rays
+    for ang_deg in (18, 52, 108, 152, 205, 250, 295, 335):
+        ang = math.radians(ang_deg)
+        dx, dy = math.cos(ang), math.sin(ang)
+        px, py = SUN_X + dx * 95, SUN_Y + dy * 95
+        qx, qy = SUN_X + dx * 330, SUN_Y + dy * 330
+        nx, ny = -dy * 7, dx * 7
+        fill_polygon([(px + nx, py + ny), (px - nx, py - ny),
+                      (qx - nx * 0.4, qy - ny * 0.4),
+                      (qx + nx * 0.4, qy + ny * 0.4)],
+                     (255, 200, 120), alpha=0.06)
+    fill_circle(SUN_X, SUN_Y, 82, (255, 214, 106))
+    fill_circle(SUN_X, SUN_Y, 64, (255, 240, 190))
+    fill_circle(SUN_X, SUN_Y, 48, (255, 250, 220))
 
-    # speed streaks trailing behind the tail — the whale is moving fast
-    for (x0, y0, x1, y1) in (
-            (150, 860, 260, 820), (180, 890, 280, 855),
-            (120, 830, 210, 795)):
-        cv.polygon([(x0, y0), (x1, y1), (x1, y1 + 4), (x0, y0 + 4)],
-                   (255, 235, 210), 0.40)
 
-    draw_whale(cv)
+def draw_clouds():
+    for cx, cy, rx, ry, a in (
+            (180, 300, 180, 26, 0.20),
+            (860, 170, 150, 22, 0.16),
+            (420, 560, 220, 30, 0.18),
+            (905, 620, 170, 24, 0.16),
+            (120, 700, 150, 22, 0.14)):
+        fill_ellipse(cx, cy, rx, ry, (255, 150, 160), alpha=a)
+        fill_ellipse(cx, cy + 10, rx * 0.8, ry * 0.7, (150, 70, 130), alpha=a * 0.7)
 
-    # low warm clouds in front of the whale's lower edge — clustered puffs
-    for (x, y, rx, ry, col, a) in (
-            (200, 815, 120, 30, (240, 150, 120), 0.20),
-            (290, 800, 130, 34, (240, 150, 120), 0.20),
-            (360, 820, 90, 26, (240, 150, 120), 0.18),
-            (700, 860, 110, 28, (238, 158, 128), 0.18),
-            (790, 850, 120, 30, (238, 158, 128), 0.18),
-            (860, 865, 80, 24, (238, 158, 128), 0.16),
-            (60, 880, 120, 26, (235, 155, 125), 0.15)):
-        cv.ellipse(x, y, rx, ry, col, 0.0, a)
 
-    # birds scattering away from the whale's path
-    for (x, y, s) in ((140, 180, 9), (210, 150, 7), (280, 205, 8),
-                      (330, 130, 6), (120, 260, 7), (380, 180, 6)):
-        cv.polygon([(x - s, y), (x, y - s * 0.55), (x + s, y)],
-                   (20, 20, 50), 0.85)
+# ----------------------------------------------------------------------- whale
+TAIL = (315.0, 775.0)
+D = (345.0, -375.0)
+D_LEN = math.hypot(*D)
+U = (D[0] / D_LEN, D[1] / D_LEN)          # along body, tail -> head
+N = (U[1], -U[0])                          # perpendicular; -N faces the sun side
+# note: U=(0.677,-0.736); N=(-0.736,-0.677) points up-left (sun side)
 
-    # tiny hot-air balloon for scale — the whale is enormous next to it
-    bx, by = BALLOON
-    cv.polygon([(bx - 4, by + 22), (bx + 4, by + 22),
-                (bx + 2, by + 30), (bx - 2, by + 30)], (90, 50, 40))
-    cv.polygon([(bx - 3, by + 12), (bx + 3, by + 12),
-                (bx + 2, by + 22), (bx - 2, by + 22)], (60, 35, 30))
-    cv.circle(bx, by, 20, (235, 90, 70))
-    cv.circle(bx, by - 4, 12, (255, 150, 90))
-    cv.ellipse(bx, by, 20, 20, (235, 90, 70))
 
-    # city skyline, tiny at the very bottom — the world the whale left
-    cv.polygon([(0, 1024), (0, 990), (1024, 990), (1024, 1024)],
-               (16, 14, 40))
-    rng2 = _lcg(777)
-    x = 0
+def center(t):
+    return (TAIL[0] + D[0] * t + N[0] * 46.0 * math.sin(math.pi * t),
+            TAIL[1] + D[1] * t + N[1] * 46.0 * math.sin(math.pi * t))
+
+
+def width_at(t):
+    return 150.0 * (math.sin(math.pi * (0.05 + 0.9 * t)) ** 0.7)
+
+
+BODY = (46, 74, 107)        # slate blue
+BELLY = (242, 227, 200)     # pale cream
+RIM = (255, 207, 92)        # gold rim light
+RIM_HI = (255, 233, 168)
+
+
+def whale_edges(steps=48):
+    upper, lower = [], []
+    for i in range(steps + 1):
+        t = i / steps
+        cx, cy = center(t)
+        w = width_at(t) / 2.0
+        upper.append((cx - N[0] * w, cy - N[1] * w))   # sun side
+        lower.append((cx + N[0] * w, cy + N[1] * w))   # belly side
+    return upper, lower
+
+
+def draw_whale():
+    upper, lower = whale_edges()
+    # tail flukes first (behind the body)
+    p0 = center(0.0)
+    back = (p0[0] - U[0] * 30, p0[1] - U[1] * 30)
+    tip_up = (back[0] - U[0] * 82 - N[0] * 72, back[1] - U[1] * 82 - N[1] * 72)
+    tip_dn = (back[0] - U[0] * 82 + N[0] * 72, back[1] - U[1] * 82 + N[1] * 72)
+    mid_up = (back[0] - U[0] * 42 - N[0] * 26, back[1] - U[1] * 42 - N[1] * 26)
+    mid_dn = (back[0] - U[0] * 42 + N[0] * 26, back[1] - U[1] * 42 + N[1] * 26)
+    fill_polygon([p0, tip_up, mid_up], BODY)
+    fill_polygon([p0, tip_dn, mid_dn], BODY)
+    polyline([p0, tip_up], 4, RIM, alpha=0.85)
+    # body
+    fill_polygon(upper + lower[::-1], BODY)
+    # pale belly along the lower edge
+    belly = []
+    for i in range(6, 46):
+        t = i / 48
+        cx, cy = center(t)
+        w = width_at(t) / 2.0
+        belly.append((cx + N[0] * w, cy + N[1] * w))
+    for i in range(45, 5, -1):
+        t = i / 48
+        cx, cy = center(t)
+        w = width_at(t) / 2.0
+        belly.append((cx + N[0] * w * 0.12, cy + N[1] * w * 0.12))
+    fill_polygon(belly, BELLY, alpha=0.88)
+    # pectoral fin on the belly side
+    fx, fy = center(0.52)
+    fin_base = (fx + N[0] * 52, fy + N[1] * 52)
+    fin_tip = (fin_base[0] + N[0] * 78 + U[0] * 34,
+               fin_base[1] + N[1] * 78 + U[1] * 34)
+    fin_w = (fin_base[0] + U[0] * 34, fin_base[1] + U[1] * 34)
+    fill_polygon([fin_base, fin_tip, fin_w], (30, 50, 75))
+    # gold rim light along the sun-side edge
+    polyline(upper, 6, RIM, alpha=0.85)
+    polyline(upper, 2, RIM_HI, alpha=0.95)
+    # eye + mouth near the head
+    ex, ey = center(0.88)
+    ex -= N[0] * 22
+    ey -= N[1] * 22
+    fill_circle(int(ex), int(ey), 6, (12, 16, 24))
+    fill_circle(int(ex) - 2, int(ey) - 2, 2, (255, 255, 255))
+    mouth = []
+    for i in range(0, 7):
+        t = 0.99 - i * 0.012
+        cx, cy = center(t)
+        w = width_at(t) / 2.0
+        mouth.append((cx + N[0] * w * 0.55, cy + N[1] * w * 0.55))
+    polyline(mouth, 3, (20, 30, 48))
+
+
+def draw_streaks():
+    # motion streaks trailing behind / below the whale
+    for t, ln in ((0.15, 190), (0.30, 230), (0.45, 210),
+                  (0.60, 250), (0.75, 200), (0.90, 160)):
+        cx, cy = center(t)
+        w = width_at(t) / 2.0
+        sx = cx + N[0] * (w + 8)
+        sy = cy + N[1] * (w + 8)
+        ex = sx - U[0] * ln + N[0] * 26
+        ey = sy - U[1] * ln + N[1] * 26
+        thick_line(int(sx), int(sy), int(ex), int(ey), 3,
+                   (255, 230, 180), alpha=0.32)
+
+
+# -------------------------------------------------------------------- balloon
+def draw_balloon():
+    bx, by = 798, 322
+    # envelope: red-orange circle with cream stripes
+    fill_circle(bx, by, 26, (214, 69, 60))
+    for y in range(by - 26, by + 27):
+        dy = y - by
+        dx = int(math.sqrt(max(0, 26 * 26 - dy * dy)))
+        fill_span(y, bx - 8, bx - 2, 250, 224, 178)
+        fill_span(y, bx + 2, bx + 8, 250, 224, 178)
+    fill_circle(bx, by + 20, 9, (255, 190, 90))
+    # ropes + basket
+    thick_line(bx - 12, by + 20, bx - 6, by + 40, 1, (60, 40, 25))
+    thick_line(bx + 12, by + 20, bx + 6, by + 40, 1, (60, 40, 25))
+    for yy in range(by + 40, by + 49):
+        fill_span(yy, bx - 7, bx + 7, 96, 62, 36)
+
+
+def draw_birds():
+    for x, y, s in ((250, 220, 1.0), (330, 180, 0.8), (560, 150, 1.1),
+                    (880, 420, 0.9), (180, 480, 1.0), (950, 520, 0.8),
+                    (420, 120, 0.9), (150, 640, 1.0), (700, 90, 0.7),
+                    (620, 640, 0.9)):
+        w = 8 * s
+        polyline([(x - w, y), (x, y + 5 * s), (x + w, y)], 2,
+                 (30, 20, 40), alpha=0.9)
+
+
+# ------------------------------------------------------------------------ city
+def draw_city():
+    rng = random.Random(2026)
+    # warm haze + horizon glow above the rooftops
+    for k in range(6):
+        blend_span(918 + k * 3, 0, W - 1, 255, 140, 70, 0.10 - k * 0.012)
+    fill_span(936, 0, W - 1, 255, 150, 80)
+    x = -10
     while x < W:
-        bw = 34 + int(next(rng2) * 46)
-        bh = 18 + int(next(rng2) * 42)
-        cv.polygon([(x, 990), (x, 990 - bh), (x + bw, 990 - bh),
-                    (x + bw, 990)], (16, 14, 40))
-        for wy in range(990 - bh + 8, 986, 12):
-            for wx in range(x + 7, x + bw - 5, 12):
-                if next(rng2) < 0.45:
-                    cv.polygon([(wx, wy), (wx + 4, wy), (wx + 4, wy + 5),
-                                (wx, wy + 5)], (255, 200, 110))
-        x += bw + 6
+        bw = rng.randint(34, 72)
+        bh = rng.randint(42, 128)
+        top = 1024 - bh
+        for yy in range(top, 1024):
+            fill_span(yy, x, x + bw, 24, 14, 34)
+        # lit windows
+        for _ in range(bw * bh // 260):
+            wx = x + rng.randint(4, max(4, bw - 8))
+            wy = top + rng.randint(6, max(6, bh - 10))
+            c = (255, 205, 110) if rng.random() > 0.25 else (140, 200, 255)
+            for yy in range(wy, wy + 4):
+                fill_span(yy, wx, wx + 2, *c)
+        # rooftop beacon on the taller towers
+        if bh > 100:
+            set_px(x + bw // 2, top - 2, 255, 60, 60)
+        x += bw + rng.randint(2, 10)
 
 
-# ---------------------------------------------------------------- PNG
+# ------------------------------------------------------------------------- png
+def write_png(path, w, h, data):
+    raw = b"".join(b"\x00" + bytes(data[y * w * 3:(y + 1) * w * 3])
+                   for y in range(h))
 
-def encode_png(cv):
-    """PNG, filter 0 (None), zlib level 9 — deterministic bytes."""
-    w, h = cv.w, cv.h
-    raw = bytearray()
-    stride = w * 3
-    for y in range(h):
-        raw.append(0)
-        raw += cv.buf[y * stride:(y + 1) * stride]
-    comp = zlib.compress(bytes(raw), 9)
-
-    def chunk(tag, data):
-        out = struct.pack(">I", len(data)) + tag + data
-        out += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        return out
+    def chunk(typ, payload):
+        c = struct.pack(">I", len(payload)) + typ + payload
+        return c + struct.pack(">I", zlib.crc32(typ + payload) & 0xFFFFFFFF)
 
     ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-    png = b"\x89PNG\r\n\x1a\n"
-    png += chunk(b"IHDR", ihdr)
-    png += chunk(b"IDAT", comp)
-    png += chunk(b"IEND", b"")
-    return png
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+    return len(png)
 
 
 def main():
-    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    draw_sky()
+    draw_stars()
+    draw_sun()
+    draw_clouds()
+    draw_streaks()
+    draw_whale()
+    draw_balloon()
+    draw_birds()
+    draw_city()
+    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(outdir, exist_ok=True)
-    cv = Canvas(W, H)
-    draw_scene(cv)
-    data = encode_png(cv)
-    with open(os.path.join(outdir, "entry.png"), "wb") as f:
-        f.write(data)
+    path = os.path.join(outdir, "entry.png")
+    size = write_png(path, W, H, buf)
+    print("wrote %s (%d bytes)" % (path, size))
 
 
 if __name__ == "__main__":
